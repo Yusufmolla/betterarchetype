@@ -57,19 +57,6 @@ cmake -S . -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build cmake-build-release --config Release
 ```
 
-## Creating A Release
-
-Push a version tag to GitHub:
-
-```bash
-git tag v0.1.0
-git push origin main
-git push origin v0.1.0
-```
-
-GitHub Actions will build macOS and Windows releases and attach the ZIP files
-to a GitHub Release.
-
 ## License
 
 BetterArchetype is licensed under AGPL-3.0-or-later.
