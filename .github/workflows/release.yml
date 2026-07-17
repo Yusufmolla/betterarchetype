@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS release
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-release --config Release
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          artifacts="build-release/BetterArchetype_artefacts/Release"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$artifacts/Standalone/BetterArchetype.app" \
+            "dist/BetterArchetype-${GITHUB_REF_NAME}-macOS-Standalone.zip"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$artifacts/AU/BetterArchetype.component" \
+            "dist/BetterArchetype-${GITHUB_REF_NAME}-macOS-AU.zip"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$artifacts/VST3/BetterArchetype.vst3" \
+            "dist/BetterArchetype-${GITHUB_REF_NAME}-macOS-VST3.zip"
+
+          ls -lh dist
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: betterarchetype-macos
+          path: dist/*.zip
+
+  build-windows:
+    name: Build Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build-release
+
+      - name: Build
+        run: cmake --build build-release --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $artifacts = "build-release/BetterArchetype_artefacts/Release"
+
+          Compress-Archive `
+            -Path "$artifacts/Standalone/BetterArchetype.exe" `
+            -DestinationPath "dist/BetterArchetype-${env:GITHUB_REF_NAME}-Windows-Standalone.zip" `
+            -Force
+
+          Compress-Archive `
+            -Path "$artifacts/VST3/BetterArchetype.vst3" `
+            -DestinationPath "dist/BetterArchetype-${env:GITHUB_REF_NAME}-Windows-VST3.zip" `
+            -Force
+
+          Get-ChildItem dist
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: betterarchetype-windows
+          path: dist/*.zip
+
+  publish-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - build-macos
+      - build-windows
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: betterarchetype-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip \
+            --title "BetterArchetype ${GITHUB_REF_NAME}" \
+            --generate-notes
