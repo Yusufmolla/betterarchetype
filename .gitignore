@@ -1,0 +1,13 @@
+# CLion und CMake Build-Ordner
+/cmake-build-*/
+/build/
+/.cmake/
+/.cache/
+# IDE Einstellungen
+.idea/
+# Meine eigene NAM Libary
+assets/NAM_ORDNER/
+example_amp.nam
+
+# Betriebssystem-Dateien
+.DS_Store

@@ -1,0 +1,22 @@
+BetterArchetype License
+
+Copyright (C) 2026 Yusuf Molla
+
+This project is licensed under the GNU Affero General Public License v3.0
+or later.
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+The full AGPLv3 license text is available here:
+https://www.gnu.org/licenses/agpl-3.0.html
+
+Third-party code keeps its own license:
+
+- JUCE: AGPLv3 or commercial JUCE license
+  https://github.com/juce-framework/JUCE/blob/master/LICENSE.md
+
+- NeuralAmpModelerCore: MIT License
+  https://github.com/sdatkinson/NeuralAmpModelerCore
+
+Audio models, impulse responses and other user-provided assets are not covered
+by this project license unless explicitly stated by their own license.
