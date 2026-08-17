@@ -4,6 +4,8 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include <vector>
+
 namespace better
 {
 class AudioModuleProcessor : public juce::AudioProcessor
@@ -15,6 +17,7 @@ public:
     const juce::String getName() const override;
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
+    void reset() override final;
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override;
     bool supportsDoublePrecisionProcessing() const override { return false; }
 
@@ -55,10 +58,6 @@ protected:
     virtual void restoreExtraState (const juce::ValueTree& state);
 
     bool isModuleEnabled() const;
-    float getFloatParameter (const juce::String& parameterId, float fallback = 0.0f) const;
-
-    double currentSampleRate = 44100.0;
-    int currentBlockSize = 512;
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout (const std::vector<ModuleControlDescriptor>& controls);

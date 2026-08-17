@@ -108,7 +108,7 @@ void GraphEditor::changeListenerCallback (juce::ChangeBroadcaster* source)
 
 void GraphEditor::timerCallback()
 {
-    if (auto* moduleProcessor = graphProcessor.getModuleProcessorForNode (selectedNode))
+    if (auto moduleProcessor = graphProcessor.getModuleProcessorForNode (selectedNode))
         controlPanel.setStatusText (moduleProcessor->getStatusText());
 }
 
@@ -151,27 +151,29 @@ juce::Point<float> GraphEditor::getNextModulePosition()
 
 void GraphEditor::chooseNAMFileForSelection()
 {
+    const auto targetUid = selectedNode;
     fileChooser = std::make_unique<juce::FileChooser> ("Load NAM model", juce::File {}, "*.nam");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                              [this] (const juce::FileChooser& chooser)
+                              [this, targetUid] (const juce::FileChooser& chooser)
     {
         const auto file = chooser.getResult();
 
         if (file.existsAsFile())
-            graphProcessor.loadNAMFileForNode (selectedNode, file);
+            graphProcessor.loadNAMFileForNode (targetUid, file);
     });
 }
 
 void GraphEditor::chooseIRFileForSelection()
 {
+    const auto targetUid = selectedNode;
     fileChooser = std::make_unique<juce::FileChooser> ("Load IR", juce::File {}, "*.wav;*.aif;*.aiff;*.flac");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                              [this] (const juce::FileChooser& chooser)
+                              [this, targetUid] (const juce::FileChooser& chooser)
     {
         const auto file = chooser.getResult();
 
         if (file.existsAsFile())
-            graphProcessor.loadIRFileForNode (selectedNode, file);
+            graphProcessor.loadIRFileForNode (targetUid, file);
     });
 }
 } // namespace better

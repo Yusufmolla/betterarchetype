@@ -2,17 +2,21 @@
 
 #include <juce_core/juce_core.h>
 
+#include <json.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "NAM/activations.h"
 #include "NAM/container.h"
-#include "NAM/convnet.h"
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
 #include "NAM/linear.h"
@@ -27,33 +31,73 @@ public:
     NAMModelLoader() = default;
     ~NAMModelLoader() = default;
 
-    void prepare (double newSampleRate, int newMaxBlockSize)
+    bool prepare (double newSampleRate, int newMaxBlockSize)
     {
-        sampleRate = newSampleRate;
-        maxBlockSize = juce::jmax (1, newMaxBlockSize);
+        if (! isSupportedSampleRate (newSampleRate))
+        {
+            const std::lock_guard<std::mutex> lock (modelMutex);
+            sampleRate = newSampleRate;
+            maxBlockSize = juce::jmax (1, newMaxBlockSize);
+            lastError = unsupportedHostSampleRateError;
+            clearModelUnlocked();
+            return false;
+        }
 
-        const std::lock_guard<std::mutex> lock (modelMutex);
+        try
+        {
+            const std::lock_guard<std::mutex> lock (modelMutex);
+            sampleRate = newSampleRate;
+            maxBlockSize = juce::jmax (1, newMaxBlockSize);
+            reserveProcessBuffers();
 
-        reserveProcessBuffers();
+            if (dspModel)
+                dspModel->Reset (sampleRate, maxBlockSize);
 
-        if (dspModel)
-            dspModel->Reset (sampleRate, maxBlockSize);
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            return failAndClear ("NAM prepare failed: " + juce::String (e.what()));
+        }
+        catch (...)
+        {
+            return failAndClear ("NAM prepare failed with an unknown error.");
+        }
     }
 
     bool loadNAMFile (const juce::File& namFile)
     {
-        lastError.clear();
+        {
+            const std::lock_guard<std::mutex> lock (modelMutex);
+            lastError.clear();
+        }
 
         if (! namFile.existsAsFile())
             return failAndClear ("Datei existiert nicht.");
 
+        const auto fileSize = namFile.getSize();
+
+        if (fileSize <= 0 || fileSize > maximumNAMFileSizeBytes)
+            return failAndClear ("NAM-Datei ist leer oder größer als 256 MiB.");
+
+        {
+            const std::lock_guard<std::mutex> lock (modelMutex);
+
+            if (! isSupportedSampleRate (sampleRate))
+            {
+                lastError = unsupportedHostSampleRateError;
+                clearModelUnlocked();
+                return false;
+            }
+        }
+
         try
         {
             forceNAMCoreParserRegistration();
-            nam::activations::Activation::disable_fast_tanh();
 
             auto modelJson = nlohmann::json::parse (namFile.loadFileAsString().toStdString());
             normalizeArchitectureNames (modelJson);
+            validateModelDocument (modelJson);
 
             nam::DspLoadOptions options;
             options.prewarm = false;
@@ -63,11 +107,35 @@ public:
             if (! loadedModel)
                 return failAndClear ("NAMCore gab kein DSP-Objekt zurück.");
 
-            loadedModel->Reset (sampleRate, maxBlockSize);
+            const auto expectedSampleRate = loadedModel->GetExpectedSampleRate();
+
+            if (! std::isfinite (expectedSampleRate)
+                || (expectedSampleRate > 0.0 && ! isSupportedSampleRate (expectedSampleRate)))
+            {
+                return failAndClear ("Das NAM-Modell wurde nicht für 48 kHz erstellt.");
+            }
+
+            if (loadedModel->NumInputChannels() <= 0
+                || loadedModel->NumInputChannels() > maximumModelChannels
+                || loadedModel->NumOutputChannels() <= 0
+                || loadedModel->NumOutputChannels() > maximumModelChannels)
+            {
+                return failAndClear ("Das NAM-Modell hat eine ungültige Kanalanzahl.");
+            }
+
             const auto loadedModelOutputTrim = calculateModelOutputTrim (*loadedModel);
 
             {
                 const std::lock_guard<std::mutex> lock (modelMutex);
+
+                if (! isSupportedSampleRate (sampleRate))
+                {
+                    lastError = unsupportedHostSampleRateError;
+                    clearModelUnlocked();
+                    return false;
+                }
+
+                loadedModel->Reset (sampleRate, maxBlockSize);
                 dspModel = std::move (loadedModel);
                 modelOutputTrim = loadedModelOutputTrim;
                 modelInputChannels = juce::jmax (1, dspModel->NumInputChannels());
@@ -75,8 +143,6 @@ public:
                 reserveProcessBuffers();
             }
 
-            currentModelFile = namFile;
-            modelName = namFile.getFileNameWithoutExtension();
             return true;
         }
         catch (const std::exception& e)
@@ -92,88 +158,139 @@ public:
     void clear()
     {
         const std::lock_guard<std::mutex> lock (modelMutex);
-        dspModel.reset();
-        modelName.clear();
-        currentModelFile = juce::File();
+        clearModelUnlocked();
     }
 
-    bool processMonoBlock (const float* input, float* output, int numSamples)
+    bool processMonoBlock (const float* input,
+                           float* output,
+                           int numSamples,
+                           float inputGain = 1.0f)
     {
-        if (input == nullptr || output == nullptr || numSamples <= 0)
+        const float* inputChannels[] { input };
+        return processInputBlock (inputChannels, 1, output, numSamples, inputGain);
+    }
+
+    bool processInputBlock (const float* const* inputChannels,
+                            int numInputChannels,
+                            float* output,
+                            int numSamples,
+                            float inputGain = 1.0f)
+    {
+        if (inputChannels == nullptr || numInputChannels <= 0
+            || output == nullptr || numSamples <= 0)
             return false;
+
+        for (int channel = 0; channel < numInputChannels; ++channel)
+        {
+            if (inputChannels[channel] == nullptr)
+                return false;
+        }
 
         std::unique_lock<std::mutex> lock (modelMutex, std::try_to_lock);
 
         if (! lock.owns_lock() || ! dspModel)
         {
-            std::copy (input, input + numSamples, output);
+            if (inputChannels[0] != output)
+                std::copy_n (inputChannels[0], numSamples, output);
+
             return false;
-        }
-
-        const auto inputChannels = juce::jmax (1, modelInputChannels);
-        const auto outputChannels = juce::jmax (1, modelOutputChannels);
-
-        for (int channel = 0; channel < inputChannels; ++channel)
-        {
-            auto& channelBuffer = modelInputBuffers[(size_t) channel];
-            inputChannelPointers[(size_t) channel] = channelBuffer.data();
-
-            for (int sample = 0; sample < numSamples; ++sample)
-                channelBuffer[(size_t) sample] = static_cast<NAM_SAMPLE> (input[sample]);
-        }
-
-        for (int channel = 0; channel < outputChannels; ++channel)
-        {
-            auto& channelBuffer = modelOutputBuffers[(size_t) channel];
-            std::fill (channelBuffer.begin(), channelBuffer.begin() + numSamples, static_cast<NAM_SAMPLE> (0));
-            outputChannelPointers[(size_t) channel] = channelBuffer.data();
         }
 
         try
         {
-            dspModel->process (inputChannelPointers.data(), outputChannelPointers.data(), numSamples);
+            const auto modelInputChannelCount = juce::jmax (1, modelInputChannels);
+            const auto modelOutputChannelCount = juce::jmax (1, modelOutputChannels);
+            const auto chunkCapacity = juce::jmax (1, maxBlockSize);
 
-            for (int i = 0; i < numSamples; ++i)
+            for (int processedSamples = 0; processedSamples < numSamples;)
             {
-                auto sample = 0.0f;
+                const auto samplesThisTime = juce::jmin (chunkCapacity, numSamples - processedSamples);
 
-                for (int channel = 0; channel < outputChannels; ++channel)
-                    sample += static_cast<float> (modelOutputBuffers[(size_t) channel][(size_t) i]);
+                for (int channel = 0; channel < modelInputChannelCount; ++channel)
+                    inputChannelPointers[(size_t) channel] = modelInputBuffers[(size_t) channel].data();
 
-                sample = (sample / static_cast<float> (outputChannels)) * modelOutputTrim;
+                for (int sample = 0; sample < samplesThisTime; ++sample)
+                {
+                    auto monoSample = 0.0f;
 
-                if (! std::isfinite (sample))
-                    sample = 0.0f;
+                    for (int channel = 0; channel < numInputChannels; ++channel)
+                        monoSample += inputChannels[channel][processedSamples + sample];
 
-                // Letzte Schutzstufe gegen kaputte oder extrem laute Modelle.
-                output[i] = juce::jlimit (-2.0f, 2.0f, sample);
+                    const auto gainedSample = (monoSample / static_cast<float> (numInputChannels))
+                                                  * inputGain;
+                    const auto modelSample = static_cast<NAM_SAMPLE> (
+                        std::isfinite (gainedSample) ? gainedSample : 0.0f);
+
+                    for (int channel = 0; channel < modelInputChannelCount; ++channel)
+                        modelInputBuffers[(size_t) channel][(size_t) sample] = modelSample;
+                }
+
+                for (int channel = 0; channel < modelOutputChannelCount; ++channel)
+                {
+                    auto& channelBuffer = modelOutputBuffers[(size_t) channel];
+                    std::fill (channelBuffer.begin(),
+                               channelBuffer.begin() + samplesThisTime,
+                               static_cast<NAM_SAMPLE> (0));
+                    outputChannelPointers[(size_t) channel] = channelBuffer.data();
+                }
+
+                dspModel->process (inputChannelPointers.data(),
+                                   outputChannelPointers.data(),
+                                   samplesThisTime);
+
+                for (int sampleIndex = 0; sampleIndex < samplesThisTime; ++sampleIndex)
+                {
+                    auto sample = 0.0f;
+
+                    for (int channel = 0; channel < modelOutputChannelCount; ++channel)
+                    {
+                        sample += static_cast<float> (
+                            modelOutputBuffers[(size_t) channel][(size_t) sampleIndex]);
+                    }
+
+                    sample = (sample / static_cast<float> (modelOutputChannelCount)) * modelOutputTrim;
+
+                    if (! std::isfinite (sample))
+                        sample = 0.0f;
+
+                    output[processedSamples + sampleIndex] = sample;
+                }
+
+                processedSamples += samplesThisTime;
             }
 
             return true;
         }
         catch (...)
         {
-            std::copy (input, input + numSamples, output);
+            if (inputChannels[0] != output)
+                std::copy_n (inputChannels[0], numSamples, output);
+
             return false;
         }
     }
 
-    [[nodiscard]] bool isModelLoaded() const
+    [[nodiscard]] juce::String getLastError() const
     {
         const std::lock_guard<std::mutex> lock (modelMutex);
-        return dspModel != nullptr;
+        return lastError;
     }
-
-    [[nodiscard]] juce::String getModelName() const { return modelName; }
-    [[nodiscard]] juce::File getCurrentModelFile() const { return currentModelFile; }
-    [[nodiscard]] juce::String getLastError() const { return lastError; }
 
 private:
     bool failAndClear (juce::String error)
     {
+        const std::lock_guard<std::mutex> lock (modelMutex);
         lastError = std::move (error);
-        clear();
+        clearModelUnlocked();
         return false;
+    }
+
+    void clearModelUnlocked()
+    {
+        dspModel.reset();
+        modelOutputTrim = 1.0f;
+        modelInputChannels = 1;
+        modelOutputChannels = 1;
     }
 
     void reserveProcessBuffers()
@@ -209,6 +326,7 @@ private:
         if (lowered == "wavenet") return "WaveNet";
         if (lowered == "lstm") return "LSTM";
         if (lowered == "convnet") return "ConvNet";
+        if (lowered == "linear") return "Linear";
 
         return name;
     }
@@ -235,6 +353,84 @@ private:
         }
     }
 
+    static void validateModelDocument (const nlohmann::json& model)
+    {
+        if (! model.is_object() || ! model.contains ("architecture"))
+            throw std::runtime_error ("NAM document has no model architecture");
+
+        validateModelNode (model);
+    }
+
+    static void validateModelNode (const nlohmann::json& node)
+    {
+        if (node.is_array())
+        {
+            for (const auto& element : node)
+                validateModelNode (element);
+
+            return;
+        }
+
+        if (! node.is_object())
+            return;
+
+        if (const auto architecture = node.find ("architecture"); architecture != node.end())
+        {
+            if (! architecture->is_string())
+                throw std::runtime_error ("NAM architecture must be a string");
+
+            const auto name = architecture->get<std::string>();
+
+            if (name == "ConvNet")
+                throw std::runtime_error ("ConvNet models are not realtime-safe and are not supported");
+
+            if (name != "SlimmableContainer" && name != "WaveNet"
+                && name != "LSTM" && name != "Linear")
+            {
+                throw std::runtime_error ("Unsupported NAM architecture: " + name);
+            }
+
+            if (! node.contains ("version") || ! node["version"].is_string()
+                || ! node.contains ("config") || ! node["config"].is_object()
+                || ! node.contains ("weights") || ! node["weights"].is_array())
+            {
+                throw std::runtime_error ("NAM model entry is incomplete");
+            }
+
+            if (const auto rate = node.find ("sample_rate"); rate != node.end())
+            {
+                if (! rate->is_number())
+                    throw std::runtime_error ("NAM model entry is not a 48 kHz model");
+
+                const auto declaredRate = rate->get<double>();
+
+                if (! std::isfinite (declaredRate)
+                    || (declaredRate > 0.0 && ! isSupportedSampleRate (declaredRate)))
+                {
+                    throw std::runtime_error ("NAM model entry is not a 48 kHz model");
+                }
+            }
+
+            for (const auto& weight : node["weights"])
+            {
+                if (! weight.is_number() || ! std::isfinite (weight.get<double>()))
+                    throw std::runtime_error ("NAM weights must be finite numbers");
+            }
+        }
+
+        for (const auto& [key, value] : node.items())
+        {
+            if (key == "groups" || key == "groups_input" || key == "groups_input_mixin")
+            {
+                if (! value.is_number_integer() || value.get<juce::int64>() <= 0)
+                    throw std::runtime_error ("NAM group counts must be positive integers");
+            }
+
+            if (key != "weights")
+                validateModelNode (value);
+        }
+    }
+
     static void forceNAMCoreParserRegistration()
     {
         using ParserFunction = std::unique_ptr<nam::ModelConfig> (*) (const nlohmann::json&, double);
@@ -242,7 +438,6 @@ private:
         // Diese Referenzen halten die NAMCore-Parser trotz LTO im Binary.
         static volatile ParserFunction keepAliveArray[] = {
             &nam::container::create_config,
-            &nam::convnet::create_config,
             &nam::linear::create_config,
             &nam::lstm::create_config,
             &nam::wavenet::create_config
@@ -263,12 +458,20 @@ private:
             return 1.0f;
 
         constexpr auto targetLoudnessDb = -18.0;
-        constexpr auto maxAutoCutDb = -12.0;
-        constexpr auto maxAutoBoostDb = 6.0;
-
-        const auto trimDb = juce::jlimit (maxAutoCutDb, maxAutoBoostDb, targetLoudnessDb - loudnessDb);
-        return static_cast<float> (std::pow (10.0, trimDb / 20.0));
+        const auto trimDb = targetLoudnessDb - loudnessDb;
+        const auto trim = static_cast<float> (std::pow (10.0, trimDb / 20.0));
+        return std::isfinite (trim) && trim > 0.0f ? trim : 1.0f;
     }
+
+    static bool isSupportedSampleRate (double rate) noexcept
+    {
+        return std::isfinite (rate) && std::abs (rate - supportedSampleRate) < 0.5;
+    }
+
+    static constexpr double supportedSampleRate = 48000.0;
+    static constexpr int maximumModelChannels = 8;
+    static constexpr juce::int64 maximumNAMFileSizeBytes = 256 * 1024 * 1024;
+    static constexpr auto unsupportedHostSampleRateError = "NAM supports 48 kHz host sessions only.";
 
     std::unique_ptr<nam::DSP> dspModel;
     mutable std::mutex modelMutex;
@@ -279,10 +482,8 @@ private:
     float modelOutputTrim = 1.0f;
     int modelInputChannels = 1;
     int modelOutputChannels = 1;
-    juce::File currentModelFile;
-    juce::String modelName;
     juce::String lastError;
-    double sampleRate = 44100.0;
+    double sampleRate = supportedSampleRate;
     int maxBlockSize = 512;
 };
 } // namespace better

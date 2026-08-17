@@ -3,6 +3,7 @@
 #include "audio/graph/GraphTypes.h"
 
 #include <memory>
+#include <vector>
 
 namespace better
 {

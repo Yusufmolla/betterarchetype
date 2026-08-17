@@ -4,9 +4,16 @@
 #include "audio/modules/NAMModelLoader.h"
 
 #include <atomic>
+#include <cstdint>
 
 namespace better
 {
+/** Graph module that wraps Neural Amp Modeler processing.
+
+    Model construction runs on a single background worker. A monotonically
+    increasing revision identifies the newest request so stale asynchronous
+    loads cannot become the published module state.
+*/
 class NAMProcessor final : public AudioModuleProcessor
 {
 public:
@@ -24,22 +31,19 @@ private:
     void writeExtraState (juce::ValueTree& state) override;
     void restoreExtraState (const juce::ValueTree& state) override;
 
-    void requestDefaultModelLoad();
-    void setStatus (juce::String newStatus);
     void clearLoadedModel (juce::String reason);
 
     NAMModelLoader namLoader;
-    juce::ThreadPool loaderPool { 1 };
-    std::atomic<int> loadRevision { 0 };
     std::atomic<bool> modelLoaded { false };
-    juce::AudioBuffer<float> monoInputBuffer;
-    juce::AudioBuffer<float> monoOutputBuffer;
-    juce::CriticalSection statusLock;
+    // Shared loader/status bookkeeping is locked; the realtime loaded flag is atomic.
+    juce::CriticalSection stateLock;
+    std::uint64_t loadRevision = 0;
     juce::String statusText = "No model loaded";
-    juce::File currentModelFile;
+    juce::File requestedModelFile;
 
-    // Rohpointer auf APVTS-Parameter; Besitz bleibt bei AudioProcessorValueTreeState.
+    // Cached non-owning APVTS parameter pointers avoid lookups on the audio thread.
     std::atomic<float>* inputParam = nullptr;
     std::atomic<float>* outputParam = nullptr;
+    juce::ThreadPool loaderPool { 1 };
 };
 } // namespace better

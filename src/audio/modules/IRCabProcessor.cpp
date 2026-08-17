@@ -1,15 +1,25 @@
 #include "audio/modules/IRCabProcessor.h"
 
+#include <cmath>
+#include <utility>
+
 namespace better
 {
+namespace
+{
+constexpr auto gatewayReferenceSampleRate = 48000.0;
+constexpr auto gatewayIRLevelDb = -18.0f;
+} // namespace
+
 IRCabProcessor::IRCabProcessor()
     : AudioModuleProcessor (createDescriptor())
 {
+    levelParam = getParameters().getRawParameterValue ("level");
 }
 
 IRCabProcessor::~IRCabProcessor()
 {
-    loaderPool.removeAllJobs (true, 4000);
+    loaderPool.removeAllJobs (true, -1);
 }
 
 ModuleDescriptor IRCabProcessor::createDescriptor()
@@ -30,59 +40,98 @@ ModuleDescriptor IRCabProcessor::createDescriptor()
 
 juce::String IRCabProcessor::getStatusText() const
 {
-    const juce::ScopedLock lock (statusLock);
+    const juce::ScopedLock lock (stateLock);
     return statusText;
+}
+
+float IRCabProcessor::calculateGatewayIRGain (double originalIRSampleRate) noexcept
+{
+    const auto validSampleRate = std::isfinite (originalIRSampleRate) && originalIRSampleRate > 0.0
+                               ? originalIRSampleRate
+                               : gatewayReferenceSampleRate;
+    const auto referenceGain = juce::Decibels::decibelsToGain (gatewayIRLevelDb);
+    return referenceGain * static_cast<float> (gatewayReferenceSampleRate / validSampleRate);
 }
 
 void IRCabProcessor::loadIRFileAsync (const juce::File& file)
 {
-    const auto revision = ++loadRevision;
-    irLoaded.store (false, std::memory_order_release);
-
     if (! file.existsAsFile())
     {
         clearLoadedIR ("No IR loaded");
         return;
     }
 
-    setStatus ("Loading " + file.getFileNameWithoutExtension() + "...");
+    std::uint64_t revision = 0;
 
-    loaderPool.addJob ([this, file, revision]
     {
-        auto ir = IRLoader::loadIRFile (file);
+        const juce::ScopedLock lock (stateLock);
+        revision = ++loadRevision;
+        requestedIRFile = file;
+        statusText = "Loading " + file.getFileNameWithoutExtension() + "...";
 
-        if (revision != loadRevision.load())
-            return;
-
-        if (ir != nullptr && ! ir->samples.empty())
+        loaderPool.addJob ([this, file, revision]
         {
-            convolver.setImpulseResponse (ir->samples, ir->sampleRate);
-            currentIRFile = file;
-            irLoaded.store (true, std::memory_order_release);
-            setStatus ("Loaded " + file.getFileNameWithoutExtension());
-            return;
-        }
+            {
+                const juce::ScopedLock stateGuard (stateLock);
 
-        currentIRFile = juce::File();
-        convolver.clear();
-        irLoaded.store (false, std::memory_order_release);
-        setStatus ("Bypass: IR could not be loaded");
-    });
+                if (revision != loadRevision)
+                    return;
+            }
+
+            auto ir = IRLoader::loadIRFile (file);
+
+            if (auto* job = juce::ThreadPoolJob::getCurrentThreadPoolJob();
+                job != nullptr && job->shouldExit())
+            {
+                return;
+            }
+
+            const auto loaded = ir != nullptr && ! ir->samples.empty();
+
+            const juce::ScopedLock stateGuard (stateLock);
+
+            if (revision != loadRevision)
+                return;
+
+            // Publish DSP data and metadata as one revision-checked operation.
+            // Lock order is always stateLock -> convolutionMutex.
+            if (loaded)
+            {
+                // JUCE already contributes originalIRRate / hostRate while
+                // resampling. This remaining factor yields Gateway's total
+                // -18 dB * 48000 / hostRate without double compensation.
+                convolver.setImpulseResponse (ir->samples,
+                                              ir->sampleRate,
+                                              calculateGatewayIRGain (ir->sampleRate));
+            }
+            else
+                convolver.clear();
+
+            statusText = loaded ? "Loaded " + file.getFileNameWithoutExtension()
+                                : "Bypass: IR could not be loaded";
+        });
+    }
 }
 
 void IRCabProcessor::onPrepared (double sampleRate, int samplesPerBlock)
 {
-    convolver.prepare (sampleRate, juce::jmax (1, getTotalNumOutputChannels()), samplesPerBlock);
+    convolver.prepare (sampleRate,
+                       juce::jmax (1, getTotalNumOutputChannels()),
+                       samplesPerBlock);
+}
+
+void IRCabProcessor::onReset()
+{
+    convolver.reset();
 }
 
 void IRCabProcessor::processAudio (juce::AudioBuffer<float>& buffer, int numSamples)
 {
-    if (! irLoaded.load (std::memory_order_acquire) || ! convolver.hasImpulseResponse())
+    if (! convolver.hasImpulseResponse() || ! convolver.process (buffer, numSamples))
         return;
 
-    convolver.process (buffer, numSamples);
-
-    const auto levelGain = juce::Decibels::decibelsToGain (getFloatParameter ("level", 0.0f));
+    const auto levelDb = levelParam != nullptr ? levelParam->load() : 0.0f;
+    const auto levelGain = juce::Decibels::decibelsToGain (levelDb);
 
     if (std::abs (levelGain - 1.0f) < 0.0001f)
         return;
@@ -92,7 +141,8 @@ void IRCabProcessor::processAudio (juce::AudioBuffer<float>& buffer, int numSamp
 
 void IRCabProcessor::writeExtraState (juce::ValueTree& state)
 {
-    state.setProperty ("irPath", currentIRFile.getFullPathName(), nullptr);
+    const juce::ScopedLock lock (stateLock);
+    state.setProperty ("irPath", requestedIRFile.getFullPathName(), nullptr);
 }
 
 void IRCabProcessor::restoreExtraState (const juce::ValueTree& state)
@@ -108,18 +158,12 @@ void IRCabProcessor::restoreExtraState (const juce::ValueTree& state)
     clearLoadedIR ("No IR loaded");
 }
 
-void IRCabProcessor::setStatus (juce::String newStatus)
-{
-    const juce::ScopedLock lock (statusLock);
-    statusText = std::move (newStatus);
-}
-
 void IRCabProcessor::clearLoadedIR (juce::String reason)
 {
+    const juce::ScopedLock lock (stateLock);
     ++loadRevision;
-    currentIRFile = juce::File();
+    requestedIRFile = juce::File {};
+    statusText = std::move (reason);
     convolver.clear();
-    irLoaded.store (false, std::memory_order_release);
-    setStatus (std::move (reason));
 }
 } // namespace better

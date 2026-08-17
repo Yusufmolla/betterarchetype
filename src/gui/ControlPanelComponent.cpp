@@ -51,7 +51,7 @@ ControlPanelComponent::ControlPanelComponent()
             onLoadIRRequested();
     };
 
-    setSelection ({}, nullptr);
+    setSelection ({}, {});
 }
 
 void ControlPanelComponent::paint (juce::Graphics& g)
@@ -91,10 +91,13 @@ void ControlPanelComponent::resized()
     }
 }
 
-void ControlPanelComponent::setSelection (GraphNodeDescription node, AudioModuleProcessor* processor)
+void ControlPanelComponent::setSelection (GraphNodeDescription node, ModuleProcessorHandle processorHandle)
 {
     selectedNode = std::move (node);
     clearControls();
+    selectedProcessor = std::move (processorHandle);
+
+    auto* processor = selectedProcessor.get();
 
     const auto title = selectedNode.uid == 0 ? "Selection" : selectedNode.name;
     titleLabel.setText (title, juce::dontSendNotification);

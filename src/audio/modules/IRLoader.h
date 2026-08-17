@@ -3,6 +3,8 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_core/juce_core.h>
 
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -13,43 +15,78 @@ class IRLoader
 public:
     struct IRData
     {
-        juce::String name;
         std::vector<float> samples;
-        int sampleRate = 44100;
+        int sampleRate = 48000;
     };
 
-    static std::unique_ptr<IRData> loadIRFile (const juce::File& irFile)
+    static std::unique_ptr<IRData> loadIRFile (const juce::File& irFile) noexcept
     {
         if (! irFile.existsAsFile())
             return {};
 
-        juce::AudioFormatManager formatManager;
-        formatManager.registerBasicFormats();
-
-        auto reader = std::unique_ptr<juce::AudioFormatReader> (formatManager.createReaderFor (irFile));
-
-        if (reader == nullptr || reader->lengthInSamples <= 0)
-            return {};
-
-        juce::AudioBuffer<float> buffer ((int) reader->numChannels, (int) reader->lengthInSamples);
-        reader->read (&buffer, 0, (int) reader->lengthInSamples, 0, true, true);
-
-        auto ir = std::make_unique<IRData>();
-        ir->name = irFile.getFileNameWithoutExtension();
-        ir->sampleRate = (int) reader->sampleRate;
-        ir->samples.resize ((size_t) buffer.getNumSamples());
-
-        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        try
         {
-            auto mono = 0.0f;
+            juce::AudioFormatManager formatManager;
+            formatManager.registerBasicFormats();
 
-            for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
-                mono += buffer.getSample (channel, sample);
+            auto reader = std::unique_ptr<juce::AudioFormatReader> (formatManager.createReaderFor (irFile));
 
-            ir->samples[(size_t) sample] = mono / static_cast<float> (juce::jmax (1, buffer.getNumChannels()));
+            if (reader == nullptr
+                || reader->numChannels == 0
+                || reader->numChannels > maximumIRChannels
+                || ! std::isfinite (reader->sampleRate)
+                || reader->sampleRate < minimumIRSampleRate
+                || reader->sampleRate > maximumIRSampleRate
+                || reader->lengthInSamples <= 0
+                || reader->lengthInSamples > std::numeric_limits<int>::max())
+            {
+                return {};
+            }
+
+            const auto maximumSamples = static_cast<juce::int64> (
+                std::ceil (reader->sampleRate * maximumIRDurationSeconds));
+
+            if (reader->lengthInSamples > maximumSamples)
+                return {};
+
+            const auto numChannels = static_cast<int> (reader->numChannels);
+            const auto numSamples = static_cast<int> (reader->lengthInSamples);
+            juce::AudioBuffer<float> buffer (numChannels, numSamples);
+
+            if (! reader->read (&buffer, 0, numSamples, 0, true, true))
+                return {};
+
+            auto ir = std::make_unique<IRData>();
+            ir->sampleRate = juce::roundToInt (reader->sampleRate);
+            ir->samples.resize (static_cast<size_t> (numSamples));
+
+            for (int sample = 0; sample < numSamples; ++sample)
+            {
+                auto mono = 0.0f;
+
+                for (int channel = 0; channel < numChannels; ++channel)
+                    mono += buffer.getSample (channel, sample);
+
+                mono /= static_cast<float> (numChannels);
+
+                if (! std::isfinite (mono))
+                    return {};
+
+                ir->samples[static_cast<size_t> (sample)] = mono;
+            }
+
+            return ir;
         }
-
-        return ir;
+        catch (...)
+        {
+            return {};
+        }
     }
+
+private:
+    static constexpr unsigned int maximumIRChannels = 8;
+    static constexpr double minimumIRSampleRate = 8000.0;
+    static constexpr double maximumIRSampleRate = 384000.0;
+    static constexpr double maximumIRDurationSeconds = 2.0;
 };
 } // namespace better

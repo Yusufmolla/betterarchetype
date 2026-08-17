@@ -2,6 +2,8 @@
 
 #include "audio/modules/ModuleProcessor.h"
 
+#include <atomic>
+
 namespace better
 {
 class RouterProcessor final : public AudioModuleProcessor
