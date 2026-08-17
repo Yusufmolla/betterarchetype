@@ -2,7 +2,8 @@
 
 #include "audio/modules/ModuleProcessor.h"
 
-#include <vector>
+#include <array>
+#include <atomic>
 
 namespace better
 {
@@ -14,12 +15,19 @@ public:
     static ModuleDescriptor createDescriptor();
 
 private:
-    void onPrepared (double sampleRate, int samplesPerBlock) override;
     void onReset() override;
     void processAudio (juce::AudioBuffer<float>& buffer, int numSamples) override;
 
-    float processSample (int channel, float sample, float drive, float tone, float levelGain);
+    float processSample (int channel,
+                         float sample,
+                         float driveGain,
+                         float tone,
+                         float lowpassCoefficient,
+                         float levelGain);
 
-    std::vector<float> toneState;
+    std::array<float, 2> toneState {};
+    std::atomic<float>* driveParam = nullptr;
+    std::atomic<float>* toneParam = nullptr;
+    std::atomic<float>* levelParam = nullptr;
 };
 } // namespace better

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "audio/graph/GraphTypes.h"
-#include "audio/modules/ModuleProcessor.h"
+#include "audio/graph/ModuleProcessorHandle.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -20,7 +20,7 @@ public:
     void paint (juce::Graphics& g) override;
     void resized() override;
 
-    void setSelection (GraphNodeDescription node, AudioModuleProcessor* processor);
+    void setSelection (GraphNodeDescription node, ModuleProcessorHandle processor);
     void setStatusText (const juce::String& text);
 
     std::function<void()> onDeleteRequested;
@@ -35,6 +35,8 @@ private:
     void addControlsFor (AudioModuleProcessor& processor);
 
     GraphNodeDescription selectedNode;
+    // This must outlive the parameter attachments declared below.
+    ModuleProcessorHandle selectedProcessor;
     juce::Label titleLabel;
     juce::Label statusLabel;
     juce::TextButton deleteButton { "Delete" };

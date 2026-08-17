@@ -1,6 +1,9 @@
 #pragma once
 
 #include <juce_core/juce_core.h>
+
+#include <cmath>
+#include <utility>
 #include <vector>
 
 namespace better

@@ -1,21 +1,22 @@
 #include "audio/modules/NAMProcessor.h"
-#include "audio/graph/AssetPaths.h"
+
+#include <utility>
 
 namespace better
 {
 NAMProcessor::NAMProcessor()
     : AudioModuleProcessor (createDescriptor())
 {
-    // Parameter-Pointer cachen; processAudio läuft im Audio-Thread.
+    // Cache parameter pointers once; APVTS retains ownership for the processor lifetime.
     inputParam = getParameters().getRawParameterValue ("input");
     outputParam = getParameters().getRawParameterValue ("output");
-
-    requestDefaultModelLoad();
 }
 
 NAMProcessor::~NAMProcessor()
 {
-    loaderPool.removeAllJobs (true, 4000);
+    // The parser cannot be interrupted while NAMCore is constructing a model.
+    // Wait until the active job has stopped before any captured members are destroyed.
+    loaderPool.removeAllJobs (true, -1);
 }
 
 ModuleDescriptor NAMProcessor::createDescriptor()
@@ -37,101 +38,121 @@ ModuleDescriptor NAMProcessor::createDescriptor()
 
 juce::String NAMProcessor::getStatusText() const
 {
-    const juce::ScopedLock lock (statusLock);
+    const juce::ScopedLock lock (stateLock);
     return statusText;
 }
 
 void NAMProcessor::loadNAMFileAsync (const juce::File& file)
 {
-    const auto revision = ++loadRevision;
-    modelLoaded.store (false, std::memory_order_release);
-
     if (! file.existsAsFile())
     {
         clearLoadedModel ("No NAM model loaded");
         return;
     }
 
-    setStatus ("Loading " + file.getFileNameWithoutExtension() + "...");
+    std::uint64_t revision = 0;
 
-    loaderPool.addJob ([this, file, revision]
     {
-        namLoader.prepare (currentSampleRate, currentBlockSize);
-        const auto loaded = namLoader.loadNAMFile (file);
-
-        if (revision != loadRevision.load())
-            return;
-
-        if (loaded)
-        {
-            currentModelFile = file;
-            modelLoaded.store (true, std::memory_order_release);
-            setStatus ("Loaded " + file.getFileNameWithoutExtension());
-            return;
-        }
-
-        currentModelFile = juce::File();
+        const juce::ScopedLock lock (stateLock);
+        revision = ++loadRevision;
         modelLoaded.store (false, std::memory_order_release);
-        setStatus ("Bypass: " + namLoader.getLastError());
-    });
+        requestedModelFile = file;
+        statusText = "Loading " + file.getFileNameWithoutExtension() + "...";
+
+        // Assigning the revision and enqueueing under the same lock preserves
+        // request order when several load requests arrive close together.
+        loaderPool.addJob ([this, file, revision]
+        {
+            if (auto* job = juce::ThreadPoolJob::getCurrentThreadPoolJob();
+                job != nullptr && job->shouldExit())
+            {
+                return;
+            }
+
+            {
+                const juce::ScopedLock stateGuard (stateLock);
+
+                if (revision != loadRevision)
+                    return;
+            }
+
+            // Parsing/model construction is deliberately kept off the audio thread.
+            const auto loaded = namLoader.loadNAMFile (file);
+            const auto error = loaded ? juce::String {} : namLoader.getLastError();
+
+            if (auto* job = juce::ThreadPoolJob::getCurrentThreadPoolJob();
+                job != nullptr && job->shouldExit())
+            {
+                return;
+            }
+
+            auto stale = false;
+
+            {
+                const juce::ScopedLock stateGuard (stateLock);
+
+                stale = revision != loadRevision;
+
+                if (! stale)
+                {
+                    modelLoaded.store (loaded, std::memory_order_release);
+                    statusText = loaded ? "Loaded " + file.getFileNameWithoutExtension()
+                                        : "Bypass: " + error;
+                }
+            }
+
+            // A newer request owns the desired state; discard this obsolete result.
+            if (stale)
+                namLoader.clear();
+        });
+    }
 }
 
 void NAMProcessor::onPrepared (double sampleRate, int samplesPerBlock)
 {
-    namLoader.prepare (sampleRate, samplesPerBlock);
-    monoInputBuffer.setSize (1, samplesPerBlock);
-    monoOutputBuffer.setSize (1, samplesPerBlock);
+    if (! namLoader.prepare (sampleRate, samplesPerBlock))
+        clearLoadedModel ("Bypass: " + namLoader.getLastError());
 }
 
+// Applies a Neural Amp Modeler network to the incoming audio signal.
+// NAM models reproduce the nonlinear behaviour of guitar amplifiers and
+// related audio equipment.
 void NAMProcessor::processAudio (juce::AudioBuffer<float>& buffer, int numSamples)
 {
-    if (! modelLoaded.load (std::memory_order_acquire) || ! namLoader.isModelLoaded())
+    if (! modelLoaded.load (std::memory_order_acquire) || buffer.getNumChannels() <= 0)
         return;
 
-    monoInputBuffer.setSize (1, numSamples, false, false, true);
-    monoOutputBuffer.setSize (1, numSamples, false, false, true);
-
-    float inDb = inputParam != nullptr ? inputParam->load() : 0.0f;
-    float outDb = outputParam != nullptr ? outputParam->load() : 0.0f;
+    const auto inDb = inputParam != nullptr ? inputParam->load() : 0.0f;
+    const auto outDb = outputParam != nullptr ? outputParam->load() : 0.0f;
 
     const auto inputGain = juce::Decibels::decibelsToGain (inDb);
     const auto outputGain = juce::Decibels::decibelsToGain (outDb);
+    auto* monoOutput = buffer.getWritePointer (0);
 
-    auto* input = monoInputBuffer.getWritePointer (0);
-
-    // NAMCore wird hier mono gefahren; Stereo wird davor zusammengefasst.
-    for (int sample = 0; sample < numSamples; ++sample)
-    {
-        auto mono = 0.0f;
-
-        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
-            mono += sanitiseAudioSample (buffer.getSample (channel, sample));
-
-        mono /= static_cast<float> (juce::jmax (1, buffer.getNumChannels()));
-        input[sample] = juce::jlimit (-1.5f, 1.5f, mono * inputGain);
-    }
-
-    // Bei einem NAM-Fehler bleibt der Originalbuffer unverändert.
-    if (! namLoader.processMonoBlock (monoInputBuffer.getReadPointer (0),
-                                      monoOutputBuffer.getWritePointer (0),
-                                      numSamples))
+    // NAM processing is mono internally, so all input channels are averaged
+    // before the model is evaluated.
+    // The loader chunks oversized host blocks internally without allocating.
+    if (! namLoader.processInputBlock (buffer.getArrayOfReadPointers(),
+                                       buffer.getNumChannels(),
+                                       monoOutput,
+                                       numSamples,
+                                       inputGain))
     {
         return;
     }
 
-    // Das mono berechnete NAM-Signal geht wieder auf alle Output-Kanäle.
-    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
-    {
-        auto* samples = buffer.getWritePointer (channel);
+    buffer.applyGain (0, 0, numSamples, outputGain);
 
-        for (int sample = 0; sample < numSamples; ++sample)
-            samples[sample] = juce::jlimit (-2.0f, 2.0f, monoOutputBuffer.getSample (0, sample) * outputGain);
-    }
+    // Broadcast the processed mono signal to every output channel.
+    for (int channel = 1; channel < buffer.getNumChannels(); ++channel)
+        buffer.copyFrom (channel, 0, buffer, 0, 0, numSamples);
 }
 
+// Persist the requested path even while loading so a project save remains reproducible.
 void NAMProcessor::writeExtraState (juce::ValueTree& state)
 {
-    state.setProperty ("modelPath", currentModelFile.getFullPathName(), nullptr);
+    const juce::ScopedLock lock (stateLock);
+    state.setProperty ("modelPath", requestedModelFile.getFullPathName(), nullptr);
 }
 
 void NAMProcessor::restoreExtraState (const juce::ValueTree& state)
@@ -144,34 +165,16 @@ void NAMProcessor::restoreExtraState (const juce::ValueTree& state)
         return;
     }
 
-    requestDefaultModelLoad();
-}
-
-void NAMProcessor::requestDefaultModelLoad()
-{
-    const auto exampleModel = AssetPaths::getAssetFile ("example_amp.nam");
-
-    if (exampleModel.existsAsFile())
-    {
-        loadNAMFileAsync (exampleModel);
-        return;
-    }
-
-    clearLoadedModel ("Bypass: assets/example_amp.nam not found");
-}
-
-void NAMProcessor::setStatus (juce::String newStatus)
-{
-    const juce::ScopedLock lock (statusLock);
-    statusText = std::move (newStatus);
+    clearLoadedModel ("No NAM model loaded");
 }
 
 void NAMProcessor::clearLoadedModel (juce::String reason)
 {
+    const juce::ScopedLock lock (stateLock);
     ++loadRevision;
-    currentModelFile = juce::File();
+    requestedModelFile = juce::File {};
     modelLoaded.store (false, std::memory_order_release);
+    statusText = std::move (reason);
     namLoader.clear();
-    setStatus (std::move (reason));
 }
 } // namespace better

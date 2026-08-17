@@ -5,7 +5,6 @@ project(BetterArchetype VERSION 0.0.1)
 add_subdirectory(libs/JUCE)
 
 set(BETTER_ARCHETYPE_ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/BetterArchetype_1024.png")
-set(BETTER_ARCHETYPE_ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/BetterArchetype_256.png")
 set(BETTER_ARCHETYPE_ICON_ARGS)
 set(BETTER_ARCHETYPE_PLUGIN_FORMATS Standalone VST3)
 
@@ -15,10 +14,6 @@ endif()
 
 if(EXISTS "${BETTER_ARCHETYPE_ICON_BIG}")
     list(APPEND BETTER_ARCHETYPE_ICON_ARGS ICON_BIG "${BETTER_ARCHETYPE_ICON_BIG}")
-endif()
-
-if(EXISTS "${BETTER_ARCHETYPE_ICON_SMALL}")
-    list(APPEND BETTER_ARCHETYPE_ICON_ARGS ICON_SMALL "${BETTER_ARCHETYPE_ICON_SMALL}")
 endif()
 
 juce_add_plugin(BetterArchetype
@@ -40,7 +35,9 @@ juce_add_plugin(BetterArchetype
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "BetterArchetype needs audio input to process your guitar signal."
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
-    COPY_PLUGIN_AFTER_BUILD TRUE
+    # Keep builds usable without administrator rights. The generated VST3 can
+    # be copied into the system plugin directory explicitly when needed.
+    COPY_PLUGIN_AFTER_BUILD FALSE
 )
 
 target_compile_features(BetterArchetype PRIVATE cxx_std_20)
@@ -48,9 +45,29 @@ target_compile_features(BetterArchetype PRIVATE cxx_std_20)
 target_include_directories(BetterArchetype
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Third-party headers should not drown out warnings from our own code.
+target_include_directories(BetterArchetype
+    SYSTEM PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/NeuralAmpModelerCore
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/NeuralAmpModelerCore/Dependencies/eigen
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/NeuralAmpModelerCore/Dependencies/nlohmann
+)
+
+set(BETTER_ARCHETYPE_NAM_CORE_SOURCES
+    libs/NeuralAmpModelerCore/NAM/activations.cpp
+    libs/NeuralAmpModelerCore/NAM/container.cpp
+    libs/NeuralAmpModelerCore/NAM/conv1d.cpp
+    libs/NeuralAmpModelerCore/NAM/dsp.cpp
+    libs/NeuralAmpModelerCore/NAM/get_dsp.cpp
+    libs/NeuralAmpModelerCore/NAM/linear.cpp
+    libs/NeuralAmpModelerCore/NAM/lstm.cpp
+    libs/NeuralAmpModelerCore/NAM/ring_buffer.cpp
+    libs/NeuralAmpModelerCore/NAM/util.cpp
+    libs/NeuralAmpModelerCore/NAM/wavenet/a2_fast.cpp
+    libs/NeuralAmpModelerCore/NAM/wavenet/model.cpp
+    libs/NeuralAmpModelerCore/NAM/wavenet/slimmable.cpp
 )
 
 target_sources(BetterArchetype
@@ -66,14 +83,14 @@ target_sources(BetterArchetype
         src/gui/ModuleBrowserComponent.h
         src/gui/NodeCanvasComponent.cpp
         src/gui/NodeCanvasComponent.h
-        src/audio/graph/AssetPaths.h
+        src/audio/graph/GraphDocument.cpp
+        src/audio/graph/GraphDocument.h
         src/audio/graph/GraphTypes.h
+        src/audio/graph/ModuleProcessorHandle.h
         src/audio/graph/ModuleRegistry.cpp
         src/audio/graph/ModuleRegistry.h
         src/audio/modules/DriveProcessor.cpp
         src/audio/modules/DriveProcessor.h
-        src/audio/modules/AmpProcessor.cpp        
-        src/audio/modules/AmpProcessor.h
         src/audio/modules/RouterProcessor.cpp
         src/audio/modules/RouterProcessor.h
         src/audio/modules/IRCabProcessor.cpp
@@ -87,20 +104,18 @@ target_sources(BetterArchetype
         src/audio/modules/SimpleConvolver.h
 
         # NAMCore wird direkt mitgebaut; es gibt kein separates Runtime-Library-Ziel.
-        libs/NeuralAmpModelerCore/NAM/activations.cpp
-        libs/NeuralAmpModelerCore/NAM/container.cpp
-        libs/NeuralAmpModelerCore/NAM/conv1d.cpp
-        libs/NeuralAmpModelerCore/NAM/convnet.cpp
-        libs/NeuralAmpModelerCore/NAM/dsp.cpp
-        libs/NeuralAmpModelerCore/NAM/get_dsp.cpp
-        libs/NeuralAmpModelerCore/NAM/linear.cpp
-        libs/NeuralAmpModelerCore/NAM/lstm.cpp
-        libs/NeuralAmpModelerCore/NAM/ring_buffer.cpp
-        libs/NeuralAmpModelerCore/NAM/util.cpp
-        libs/NeuralAmpModelerCore/NAM/wavenet/a2_fast.cpp
-        libs/NeuralAmpModelerCore/NAM/wavenet/model.cpp
-        libs/NeuralAmpModelerCore/NAM/wavenet/slimmable.cpp
+        ${BETTER_ARCHETYPE_NAM_CORE_SOURCES}
 )
+
+if(MSVC)
+    set_source_files_properties(${BETTER_ARCHETYPE_NAM_CORE_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "/wd4100;/wd4244;/wd4267;/wd4305;/wd4458"
+    )
+else()
+    set_source_files_properties(${BETTER_ARCHETYPE_NAM_CORE_SOURCES}
+        PROPERTIES COMPILE_OPTIONS -w
+    )
+endif()
 
 target_compile_definitions(BetterArchetype
     PRIVATE
@@ -111,7 +126,6 @@ target_compile_definitions(BetterArchetype
         NAM_SAMPLE_FLOAT=1
         NOMINMAX
         WIN32_LEAN_AND_MEAN
-        BETTER_ARCHETYPE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
 )
 
 target_link_libraries(BetterArchetype
@@ -126,3 +140,58 @@ target_link_libraries(BetterArchetype
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+option(BETTER_ARCHETYPE_BUILD_TESTS "Build the local BetterArchetype test runner" ON)
+
+if(BETTER_ARCHETYPE_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(BetterArchetypeTests)
+
+    # Keep release builds focused on the plugin. The test executable remains
+    # available as an explicit target in CLion and from the command line.
+    set_target_properties(BetterArchetypeTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    target_compile_features(BetterArchetypeTests PRIVATE cxx_std_20)
+
+    target_sources(BetterArchetypeTests
+        PRIVATE
+            tests/TestMain.cpp
+            tests/CoreTests.cpp
+            tests/GraphDocumentTests.cpp
+    )
+
+    target_include_directories(BetterArchetypeTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    target_include_directories(BetterArchetypeTests
+        SYSTEM PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/libs/JUCE/modules
+            ${CMAKE_CURRENT_SOURCE_DIR}/libs/NeuralAmpModelerCore
+            ${CMAKE_CURRENT_SOURCE_DIR}/libs/NeuralAmpModelerCore/Dependencies/eigen
+            ${CMAKE_CURRENT_SOURCE_DIR}/libs/NeuralAmpModelerCore/Dependencies/nlohmann
+    )
+
+    target_compile_definitions(BetterArchetypeTests
+        PRIVATE
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            JUCE_VST3_CAN_REPLACE_VST2=0
+            JUCE_ASIO=1
+            NAM_SAMPLE_FLOAT=1
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            JucePlugin_Build_Standalone=0
+            BETTER_ARCHETYPE_TEST_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/tests"
+    )
+
+    target_link_libraries(BetterArchetypeTests
+        PRIVATE
+            BetterArchetype
+    )
+
+    add_test(NAME BetterArchetypeTests COMMAND BetterArchetypeTests)
+    set_tests_properties(BetterArchetypeTests PROPERTIES TIMEOUT 120)
+endif()

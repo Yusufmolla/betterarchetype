@@ -4,7 +4,13 @@
 #include "gui/GraphEditor.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
+#include <utility>
 
 namespace better
 {
@@ -16,49 +22,269 @@ constexpr auto nodeTag = "Node";
 constexpr auto connectionsTag = "Connections";
 constexpr auto connectionTag = "Connection";
 
-float applySafetyLimiter (float sample) noexcept
+// Parse and validate host state before any runtime graph is touched.
+struct ParsedGraphState
 {
-    sample = sanitiseAudioSample (sample);
+    GraphDocument document = GraphDocument::createEmpty();
+    std::map<GraphNodeUID, juce::ValueTree> moduleStates;
+};
 
-    constexpr auto threshold = 0.98f;
+template <typename Number>
+bool parseNumber (const juce::String& text, Number& result)
+{
+    const auto utf8 = text.toStdString();
+    const auto* begin = utf8.data();
+    const auto* end = begin + utf8.size();
+    const auto parsed = std::from_chars (begin, end, result);
+    return parsed.ec == std::errc {} && parsed.ptr == end;
+}
 
-    if (sample > threshold)
-        return threshold + (std::tanh ((sample - threshold) * 0.3f) * (1.0f - threshold));
+bool readIntegerProperty (const juce::ValueTree& tree, const juce::Identifier& property, juce::int64& result)
+{
+    if (! tree.hasProperty (property))
+        return false;
 
-    if (sample < -threshold)
-        return -threshold + (std::tanh ((sample + threshold) * 0.3f) * (1.0f - threshold));
+    const auto value = tree.getProperty (property);
 
-    return sample;
+    if (value.isInt() || value.isInt64())
+    {
+        result = static_cast<juce::int64> (value);
+        return true;
+    }
+
+    return value.isString() && parseNumber (value.toString(), result);
+}
+
+bool readNodeUID (const juce::ValueTree& tree, const juce::Identifier& property, GraphNodeUID& result)
+{
+    juce::int64 value = 0;
+
+    if (! readIntegerProperty (tree, property, value)
+        || value <= 0
+        || value > std::numeric_limits<int>::max())
+    {
+        return false;
+    }
+
+    result = static_cast<GraphNodeUID> (value);
+    return true;
+}
+
+bool readPosition (const juce::ValueTree& tree, juce::Point<float>& result)
+{
+    const auto readCoordinate = [&tree] (const juce::Identifier& property, float fallback, float& coordinate)
+    {
+        if (! tree.hasProperty (property))
+        {
+            coordinate = fallback;
+            return true;
+        }
+
+        const auto value = tree.getProperty (property);
+
+        double parsed = 0.0;
+
+        if (value.isInt() || value.isInt64() || value.isDouble())
+            parsed = static_cast<double> (value);
+        else if (! value.isString() || ! parseNumber (value.toString(), parsed))
+            return false;
+
+        coordinate = static_cast<float> (parsed);
+        return std::isfinite (coordinate);
+    };
+
+    return readCoordinate ("x", 100.0f, result.x)
+        && readCoordinate ("y", 100.0f, result.y);
+}
+
+std::optional<GraphNodeRole> parseNodeRole (const juce::ValueTree& nodeState)
+{
+    if (! nodeState.hasProperty ("role"))
+        return std::nullopt;
+
+    const auto role = nodeState.getProperty ("role").toString();
+
+    if (role == "input")  return GraphNodeRole::input;
+    if (role == "output") return GraphNodeRole::output;
+    if (role == "module") return GraphNodeRole::module;
+    return std::nullopt;
+}
+
+// Reconstruct the logical document through its validation API instead of
+// trusting serialized nodes and connections directly.
+std::optional<ParsedGraphState> parseStoredGraphState (const juce::ValueTree& state)
+{
+    if (! state.hasType (stateTag))
+        return std::nullopt;
+
+    if (state.hasProperty ("version"))
+    {
+        juce::int64 version = 0;
+
+        if (! readIntegerProperty (state, "version", version) || version != 1)
+            return std::nullopt;
+    }
+
+    const auto nodes = state.getChildWithName (nodesTag);
+
+    if (! nodes.isValid())
+        return std::nullopt;
+
+    ParsedGraphState parsed;
+    std::set<GraphNodeUID> seenNodeUIDs;
+
+    for (int i = 0; i < nodes.getNumChildren(); ++i)
+    {
+        const auto nodeState = nodes.getChild (i);
+        GraphNodeUID uid = 0;
+        juce::Point<float> position;
+        const auto role = parseNodeRole (nodeState);
+
+        if (! nodeState.hasType (nodeTag)
+            || ! readNodeUID (nodeState, "uid", uid)
+            || ! readPosition (nodeState, position)
+            || ! role.has_value()
+            || ! seenNodeUIDs.insert (uid).second)
+        {
+            return std::nullopt;
+        }
+
+        if (uid == inputNodeUID || uid == outputNodeUID)
+        {
+            const auto requiredRole = uid == inputNodeUID ? GraphNodeRole::input : GraphNodeRole::output;
+
+            if (*role != requiredRole || ! parsed.document.setNodePosition (uid, position))
+                return std::nullopt;
+
+            continue;
+        }
+
+        if (*role != GraphNodeRole::module)
+            return std::nullopt;
+
+        const auto moduleId = nodeState.getProperty ("moduleId").toString();
+        const auto* descriptor = ModuleRegistry::findModule (moduleId);
+
+        if (descriptor == nullptr || ! parsed.document.restoreModuleNode (uid, *descriptor, position))
+            return std::nullopt;
+
+        if (const auto moduleState = nodeState.getChildWithName ("ModuleState"); moduleState.isValid())
+        {
+            if (! moduleState.hasProperty ("moduleId")
+                || moduleState.getProperty ("moduleId").toString() != moduleId)
+            {
+                return std::nullopt;
+            }
+
+            parsed.moduleStates.emplace (uid, moduleState);
+        }
+    }
+
+    if (seenNodeUIDs.find (inputNodeUID) == seenNodeUIDs.end()
+        || seenNodeUIDs.find (outputNodeUID) == seenNodeUIDs.end())
+    {
+        return std::nullopt;
+    }
+
+    if (state.hasProperty ("nextModuleNode"))
+    {
+        GraphNodeUID nextModuleNode = 0;
+
+        if (! readNodeUID (state, "nextModuleNode", nextModuleNode)
+            || ! parsed.document.restoreNextModuleNodeUID (nextModuleNode))
+        {
+            return std::nullopt;
+        }
+    }
+
+    const auto connections = state.getChildWithName (connectionsTag);
+
+    if (! connections.isValid())
+    {
+        if (! parsed.document.addConnection ({ inputNodeUID, outputNodeUID }))
+            return std::nullopt;
+
+        return parsed;
+    }
+
+    for (int i = 0; i < connections.getNumChildren(); ++i)
+    {
+        const auto connectionState = connections.getChild (i);
+        GraphConnectionDescription connection;
+
+        if (! connectionState.hasType (connectionTag)
+            || ! readNodeUID (connectionState, "source", connection.source)
+            || ! readNodeUID (connectionState, "destination", connection.destination)
+            || ! parsed.document.addConnection (connection))
+        {
+            return std::nullopt;
+        }
+    }
+
+    return parsed;
 }
 } // namespace
 
 GraphAudioProcessor::GraphAudioProcessor()
     : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+                                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      audioGraph (std::make_unique<Graph>())
 {
-    audioGraph.setPlayConfigDetails (2, 2, currentSampleRate, currentBlockSize);
+    audioGraph->setPlayConfigDetails (2, 2, currentSampleRate, currentBlockSize);
     buildDefaultGraph();
 }
 
-GraphAudioProcessor::~GraphAudioProcessor() = default;
+GraphAudioProcessor::~GraphAudioProcessor()
+{
+    if (audioGraph != nullptr)
+        detachModuleProcessorListeners (*audioGraph);
+}
 
 void GraphAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    const juce::ScopedLock lock (graphLock);
+
+    if (graphPrepared)
+    {
+        audioGraph->releaseResources();
+        graphPrepared = false;
+    }
+
     currentSampleRate = sampleRate;
     currentBlockSize = juce::jmax (1, samplesPerBlock);
 
-    const juce::ScopedLock lock (graphLock);
-    audioGraph.setPlayConfigDetails (getTotalNumInputChannels(),
-                                     getTotalNumOutputChannels(),
-                                     currentSampleRate,
-                                     currentBlockSize);
-    audioGraph.prepareToPlay (currentSampleRate, currentBlockSize);
-    rebuildAudioGraphConnections();
+    audioGraph->setPlayConfigDetails (getTotalNumInputChannels(),
+                                      getTotalNumOutputChannels(),
+                                      currentSampleRate,
+                                      currentBlockSize);
+
+    if (! rebuildAudioGraphConnections (*audioGraph, graphDocument))
+    {
+        jassertfalse;
+        return;
+    }
+
+    audioGraph->prepareToPlay (currentSampleRate, currentBlockSize);
+    graphPrepared = true;
 }
 
 void GraphAudioProcessor::releaseResources()
 {
-    audioGraph.releaseResources();
+    const juce::ScopedLock lock (graphLock);
+
+    if (! graphPrepared)
+        return;
+
+    audioGraph->releaseResources();
+    graphPrepared = false;
+}
+
+void GraphAudioProcessor::reset()
+{
+    const juce::ScopedLock lock (graphLock);
+
+    if (graphPrepared)
+        audioGraph->reset();
 }
 
 void GraphAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
@@ -68,14 +294,15 @@ void GraphAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     for (auto channel = getTotalNumInputChannels(); channel < getTotalNumOutputChannels(); ++channel)
         buffer.clear (channel, 0, buffer.getNumSamples());
 
-    audioGraph.processBlock (buffer, midiMessages);
+    audioGraph->processBlock (buffer, midiMessages);
 
+    // Prevent invalid floating-point values from escaping into downstream host processing.
     for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
     {
         auto* samples = buffer.getWritePointer (channel);
 
         for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
-            samples[sample] = applySafetyLimiter (samples[sample]);
+            samples[sample] = sanitiseAudioSample (samples[sample]);
     }
 }
 
@@ -108,277 +335,317 @@ bool GraphAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
     if (input.isDisabled() || output.isDisabled())
         return false;
 
-    return (input == juce::AudioChannelSet::mono() || input == juce::AudioChannelSet::stereo())
-        && (output == juce::AudioChannelSet::mono() || output == juce::AudioChannelSet::stereo());
+    return input == output
+        && (input == juce::AudioChannelSet::mono() || input == juce::AudioChannelSet::stereo());
 }
 
 bool GraphAudioProcessor::addModuleNode (const juce::String& moduleId,
                                          juce::Point<float> position,
                                          GraphNodeUID& createdNode)
 {
-    const juce::ScopedLock lock (graphLock);
+    {
+        const juce::ScopedLock lock (graphLock);
+        const auto* descriptor = ModuleRegistry::findModule (moduleId);
 
-    const auto uid = nextModuleNode++;
+        if (descriptor == nullptr)
+            return false;
 
-    if (! addModuleNodeInternal (uid, moduleId, position, nullptr))
-        return false;
+        // Validate on a copy; publish the document only after runtime creation succeeds.
+        auto candidate = graphDocument;
+        GraphNodeUID uid = 0;
 
-    createdNode = uid;
-    audioGraph.rebuild();
+        if (! candidate.addModuleNode (*descriptor, position, uid))
+            return false;
+
+        auto processor = ModuleRegistry::createProcessor (moduleId);
+        auto* processorToObserve = processor.get();
+
+        if (processor == nullptr || ! addModuleNodeToRuntime (*audioGraph, uid, std::move (processor)))
+            return false;
+
+        graphDocument = std::move (candidate);
+        createdNode = uid;
+        processorToObserve->addListener (this);
+        audioGraph->rebuild();
+    }
+
     sendChangeMessage();
+    notifyHostStateChanged();
     return true;
 }
 
 bool GraphAudioProcessor::removeGraphNode (GraphNodeUID uid)
 {
-    if (uid == inputNodeUID || uid == outputNodeUID)
-        return false;
-
-    const juce::ScopedLock lock (graphLock);
-
-    if (nodeRecords.find (uid) == nodeRecords.end())
-        return false;
-
-    audioGraph.removeNode (toNodeID (uid), Graph::UpdateKind::none);
-    nodeRecords.erase (uid);
-
-    logicalConnections.erase (std::remove_if (logicalConnections.begin(), logicalConnections.end(), [uid] (const auto& connection)
     {
-        return connection.source == uid || connection.destination == uid;
-    }), logicalConnections.end());
+        const juce::ScopedLock lock (graphLock);
+        auto candidate = graphDocument;
 
-    rebuildAudioGraphConnections();
+        if (! candidate.removeNode (uid))
+            return false;
+
+        auto removedNode = audioGraph->removeNode (toNodeID (uid), Graph::UpdateKind::none);
+
+        if (removedNode == nullptr)
+            return false;
+
+        if (auto* processor = dynamic_cast<AudioModuleProcessor*> (removedNode->getProcessor()))
+            processor->removeListener (this);
+
+        graphDocument = std::move (candidate);
+        audioGraph->rebuild();
+    }
+
     sendChangeMessage();
+    notifyHostStateChanged();
     return true;
 }
 
 bool GraphAudioProcessor::addGraphConnection (GraphNodeUID source, GraphNodeUID destination)
 {
-    const juce::ScopedLock lock (graphLock);
+    {
+        const juce::ScopedLock lock (graphLock);
+        auto candidate = graphDocument;
 
-    if (! addLogicalConnectionInternal ({ source, destination }))
-        return false;
+        if (! candidate.addConnection ({ source, destination }))
+            return false;
 
-    rebuildAudioGraphConnections();
+        // Keep the previous document so channel-level runtime rebuild failures can roll back.
+        const auto previous = graphDocument;
+        graphDocument = std::move (candidate);
+
+        if (! rebuildAudioGraphConnections (*audioGraph, graphDocument))
+        {
+            graphDocument = previous;
+
+            if (! rebuildAudioGraphConnections (*audioGraph, graphDocument))
+                jassertfalse;
+
+            return false;
+        }
+    }
+
     sendChangeMessage();
+    notifyHostStateChanged();
     return true;
 }
 
 bool GraphAudioProcessor::removeGraphConnection (GraphConnectionDescription connection)
 {
-    const juce::ScopedLock lock (graphLock);
+    {
+        const juce::ScopedLock lock (graphLock);
+        auto candidate = graphDocument;
 
-    const auto oldSize = logicalConnections.size();
-    logicalConnections.erase (std::remove (logicalConnections.begin(), logicalConnections.end(), connection),
-                              logicalConnections.end());
+        if (! candidate.removeConnection (connection))
+            return false;
 
-    if (oldSize == logicalConnections.size())
-        return false;
+        // Keep the previous document so channel-level runtime rebuild failures can roll back.
+        const auto previous = graphDocument;
+        graphDocument = std::move (candidate);
 
-    rebuildAudioGraphConnections();
+        if (! rebuildAudioGraphConnections (*audioGraph, graphDocument))
+        {
+            graphDocument = previous;
+
+            if (! rebuildAudioGraphConnections (*audioGraph, graphDocument))
+                jassertfalse;
+
+            return false;
+        }
+    }
+
     sendChangeMessage();
+    notifyHostStateChanged();
     return true;
 }
 
 void GraphAudioProcessor::setGraphNodePosition (GraphNodeUID uid, juce::Point<float> position)
 {
     const juce::ScopedLock lock (graphLock);
-
-    if (auto it = nodeRecords.find (uid); it != nodeRecords.end())
-    {
-        it->second.description.x = position.x;
-        it->second.description.y = position.y;
-    }
+    graphDocument.setNodePosition (uid, position);
 }
 
 std::vector<GraphNodeDescription> GraphAudioProcessor::getGraphNodes() const
 {
     const juce::ScopedLock lock (graphLock);
-
-    std::vector<GraphNodeDescription> result;
-    result.reserve (nodeRecords.size());
-
-    for (const auto& [uid, record] : nodeRecords)
-    {
-        juce::ignoreUnused (uid);
-        result.push_back (record.description);
-    }
-
-    return result;
+    return graphDocument.getNodes();
 }
 
 std::vector<GraphConnectionDescription> GraphAudioProcessor::getGraphConnections() const
 {
     const juce::ScopedLock lock (graphLock);
-    return logicalConnections;
+    return graphDocument.getConnections();
 }
 
 GraphNodeDescription GraphAudioProcessor::getGraphNode (GraphNodeUID uid) const
 {
     const juce::ScopedLock lock (graphLock);
 
-    if (auto it = nodeRecords.find (uid); it != nodeRecords.end())
-        return it->second.description;
+    if (const auto* node = graphDocument.findNode (uid))
+        return *node;
 
     return {};
 }
 
-AudioModuleProcessor* GraphAudioProcessor::getModuleProcessorForNode (GraphNodeUID uid) const
+ModuleProcessorHandle GraphAudioProcessor::getModuleProcessorForNode (GraphNodeUID uid) const
 {
     const juce::ScopedLock lock (graphLock);
 
-    if (auto* node = audioGraph.getNodeForId (toNodeID (uid)))
-        return dynamic_cast<AudioModuleProcessor*> (node->getProcessor());
+    if (auto* node = audioGraph->getNodeForId (toNodeID (uid)))
+        return ModuleProcessorHandle { Graph::Node::Ptr { node } };
 
-    return nullptr;
+    return {};
 }
 
 void GraphAudioProcessor::loadNAMFileForNode (GraphNodeUID uid, const juce::File& file)
 {
-    if (auto* processor = getModuleProcessorForNode (uid))
+    if (auto processor = getModuleProcessorForNode (uid))
+    {
+        if (! processor->getDescriptor().canLoadNAM)
+            return;
+
         processor->loadNAMFileAsync (file);
+        notifyHostStateChanged();
+    }
 }
 
 void GraphAudioProcessor::loadIRFileForNode (GraphNodeUID uid, const juce::File& file)
 {
-    if (auto* processor = getModuleProcessorForNode (uid))
+    if (auto processor = getModuleProcessorForNode (uid))
+    {
+        if (! processor->getDescriptor().canLoadIR)
+            return;
+
         processor->loadIRFileAsync (file);
+        notifyHostStateChanged();
+    }
+}
+
+void GraphAudioProcessor::audioProcessorParameterChanged (juce::AudioProcessor* processor,
+                                                          int parameterIndex,
+                                                          float newValue)
+{
+    juce::ignoreUnused (processor, parameterIndex, newValue);
+    notifyHostStateChanged();
+}
+
+void GraphAudioProcessor::audioProcessorChanged (
+    juce::AudioProcessor* processor,
+    const juce::AudioProcessorListener::ChangeDetails& details)
+{
+    juce::ignoreUnused (processor);
+
+    if (details.nonParameterStateChanged)
+        notifyHostStateChanged();
+}
+
+// Graph edits and loaded assets are non-parameter state, so explicitly mark the
+// plug-in state dirty for the host.
+void GraphAudioProcessor::notifyHostStateChanged()
+{
+    updateHostDisplay (juce::AudioProcessorListener::ChangeDetails {}
+                           .withNonParameterStateChanged (true));
+}
+
+void GraphAudioProcessor::attachModuleProcessorListeners (Graph& runtime)
+{
+    for (auto* node : runtime.getNodes())
+        if (auto* processor = dynamic_cast<AudioModuleProcessor*> (node->getProcessor()))
+            processor->addListener (this);
+}
+
+void GraphAudioProcessor::detachModuleProcessorListeners (Graph& runtime)
+{
+    for (auto* node : runtime.getNodes())
+        if (auto* processor = dynamic_cast<AudioModuleProcessor*> (node->getProcessor()))
+            processor->removeListener (this);
 }
 
 void GraphAudioProcessor::buildDefaultGraph()
 {
     const juce::ScopedLock lock (graphLock);
 
-    audioGraph.clear (Graph::UpdateKind::none);
-    nodeRecords.clear();
-    logicalConnections.clear();
-    nextModuleNode = firstModuleNodeUID;
+    audioGraph->clear (Graph::UpdateKind::none);
+    graphDocument = GraphDocument {};
 
-    addIONode (inputNodeUID, GraphNodeRole::input, { 130.0f, 260.0f });
-    addIONode (outputNodeUID, GraphNodeRole::output, { 820.0f, 260.0f });
-    addLogicalConnectionInternal ({ inputNodeUID, outputNodeUID });
-    rebuildAudioGraphConnections();
+    const auto* input = graphDocument.findNode (inputNodeUID);
+    const auto* output = graphDocument.findNode (outputNodeUID);
+    const auto endpointsAdded = input != nullptr && output != nullptr
+                             && addIONodeToRuntime (*audioGraph, *input)
+                             && addIONodeToRuntime (*audioGraph, *output);
+
+    if (! endpointsAdded || ! rebuildAudioGraphConnections (*audioGraph, graphDocument))
+        jassertfalse;
 }
 
-bool GraphAudioProcessor::addIONode (GraphNodeUID uid, GraphNodeRole role, juce::Point<float> position)
+bool GraphAudioProcessor::addIONodeToRuntime (Graph& runtime,
+                                              const GraphNodeDescription& description)
 {
-    const auto type = role == GraphNodeRole::input
+    if (description.role != GraphNodeRole::input && description.role != GraphNodeRole::output)
+        return false;
+
+    const auto type = description.role == GraphNodeRole::input
                     ? Graph::AudioGraphIOProcessor::audioInputNode
                     : Graph::AudioGraphIOProcessor::audioOutputNode;
 
-    auto node = audioGraph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (type),
-                                    toNodeID (uid),
-                                    Graph::UpdateKind::none);
-
-    if (node == nullptr)
-        return false;
-
-    NodeRecord record;
-    record.description.uid = uid;
-    record.description.role = role;
-    record.description.name = role == GraphNodeRole::input ? "Input" : "Output";
-    record.description.x = position.x;
-    record.description.y = position.y;
-    nodeRecords[uid] = record;
-    return true;
+    auto node = runtime.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (type),
+                                 toNodeID (description.uid),
+                                 Graph::UpdateKind::none);
+    return node != nullptr;
 }
 
-bool GraphAudioProcessor::addModuleNodeInternal (GraphNodeUID uid,
-                                                 const juce::String& moduleId,
-                                                 juce::Point<float> position,
-                                                 const juce::ValueTree* moduleState)
+bool GraphAudioProcessor::addModuleNodeToRuntime (Graph& runtime,
+                                                  GraphNodeUID uid,
+                                                  std::unique_ptr<AudioModuleProcessor> processor)
 {
-    auto processor = ModuleRegistry::createProcessor (moduleId);
-
     if (processor == nullptr)
         return false;
 
-    const auto moduleName = processor->getDescriptor().name;
-
-    if (moduleState != nullptr)
-        processor->restoreModuleState (*moduleState);
-
-    auto node = audioGraph.addNode (std::move (processor), toNodeID (uid), Graph::UpdateKind::none);
-
-    if (node == nullptr)
-        return false;
-
-    NodeRecord record;
-    record.description.uid = uid;
-    record.description.role = GraphNodeRole::module;
-    record.description.moduleId = moduleId;
-    record.description.name = moduleName;
-    record.description.x = position.x;
-    record.description.y = position.y;
-    nodeRecords[uid] = record;
-    nextModuleNode = juce::jmax (nextModuleNode, uid + 1);
-    return true;
+    auto node = runtime.addNode (std::move (processor), toNodeID (uid), Graph::UpdateKind::none);
+    return node != nullptr;
 }
 
-bool GraphAudioProcessor::canAddLogicalConnection (GraphConnectionDescription connection) const
+// Materialise validated logical edges as JUCE channel connections. A failed
+// rebuild removes any partial wiring before returning.
+bool GraphAudioProcessor::rebuildAudioGraphConnections (Graph& runtime,
+                                                        const GraphDocument& document)
 {
-    if (connection.source == 0 || connection.destination == 0 || connection.source == connection.destination)
-        return false;
-
-    if (std::find (logicalConnections.begin(), logicalConnections.end(), connection) != logicalConnections.end())
-        return false;
-
-    const auto source = nodeRecords.find (connection.source);
-    const auto destination = nodeRecords.find (connection.destination);
-
-    if (source == nodeRecords.end() || destination == nodeRecords.end())
-        return false;
-
-    if (source->second.description.role == GraphNodeRole::output
-        || destination->second.description.role == GraphNodeRole::input)
-    {
-        return false;
-    }
-
-    return ! audioGraph.isAnInputTo (toNodeID (connection.destination), toNodeID (connection.source));
-}
-
-bool GraphAudioProcessor::addLogicalConnectionInternal (GraphConnectionDescription connection)
-{
-    if (! canAddLogicalConnection (connection))
-        return false;
-
-    logicalConnections.push_back (connection);
-    return true;
-}
-
-void GraphAudioProcessor::rebuildAudioGraphConnections()
-{
-    const auto existingConnections = audioGraph.getConnections();
+    const auto existingConnections = runtime.getConnections();
 
     for (const auto& connection : existingConnections)
-        audioGraph.removeConnection (connection, Graph::UpdateKind::none);
+        runtime.removeConnection (connection, Graph::UpdateKind::none);
 
-    std::vector<GraphConnectionDescription> keptConnections;
-    keptConnections.reserve (logicalConnections.size());
-
-    for (const auto& connection : logicalConnections)
+    for (const auto& connection : document.getConnections())
     {
-        if (addAudioConnectionsFor (connection))
-            keptConnections.push_back (connection);
+        if (! addAudioConnectionsFor (runtime, connection))
+        {
+            const auto partiallyRebuiltConnections = runtime.getConnections();
+
+            for (const auto& partiallyRebuiltConnection : partiallyRebuiltConnections)
+                runtime.removeConnection (partiallyRebuiltConnection, Graph::UpdateKind::none);
+
+            runtime.rebuild();
+            return false;
+        }
     }
 
-    logicalConnections = std::move (keptConnections);
-    audioGraph.rebuild();
+    runtime.rebuild();
+    return true;
 }
 
-bool GraphAudioProcessor::addAudioConnectionsFor (GraphConnectionDescription connection)
+bool GraphAudioProcessor::addAudioConnectionsFor (Graph& runtime,
+                                                   GraphConnectionDescription connection)
 {
-    const auto sourceChannels = getNodeOutputChannelCount (connection.source);
-    const auto destinationChannels = getNodeInputChannelCount (connection.destination);
+    const auto sourceChannels = getNodeOutputChannelCount (runtime, connection.source);
+    const auto destinationChannels = getNodeInputChannelCount (runtime, connection.destination);
 
     if (sourceChannels <= 0 || destinationChannels <= 0)
         return false;
 
-    auto addedAny = false;
+    std::vector<Graph::Connection> addedConnections;
+    addedConnections.reserve (static_cast<size_t> (destinationChannels));
 
-    // Eine logische Node-Verbindung wird auf echte JUCE-Kanalverbindungen abgebildet.
-    // Mono-Quellen werden dabei bei Bedarf auf Stereo-Ziele gespiegelt.
+    // A logical edge expands to the required JUCE channel connections. Mono
+    // sources are duplicated when the destination exposes more channels.
     for (int destinationChannel = 0; destinationChannel < destinationChannels; ++destinationChannel)
     {
         const auto sourceChannel = juce::jmin (destinationChannel, sourceChannels - 1);
@@ -389,24 +656,31 @@ bool GraphAudioProcessor::addAudioConnectionsFor (GraphConnectionDescription con
             { toNodeID (connection.destination), destinationChannel }
         };
 
-        if (audioGraph.addConnection (graphConnection, Graph::UpdateKind::none))
-            addedAny = true;
+        if (! runtime.addConnection (graphConnection, Graph::UpdateKind::none))
+        {
+            for (const auto& addedConnection : addedConnections)
+                runtime.removeConnection (addedConnection, Graph::UpdateKind::none);
+
+            return false;
+        }
+
+        addedConnections.push_back (graphConnection);
     }
 
-    return addedAny;
+    return true;
 }
 
-int GraphAudioProcessor::getNodeOutputChannelCount (GraphNodeUID uid) const
+int GraphAudioProcessor::getNodeOutputChannelCount (const Graph& runtime, GraphNodeUID uid)
 {
-    if (auto* node = audioGraph.getNodeForId (toNodeID (uid)))
+    if (auto* node = runtime.getNodeForId (toNodeID (uid)))
         return node->getProcessor()->getTotalNumOutputChannels();
 
     return 0;
 }
 
-int GraphAudioProcessor::getNodeInputChannelCount (GraphNodeUID uid) const
+int GraphAudioProcessor::getNodeInputChannelCount (const Graph& runtime, GraphNodeUID uid)
 {
-    if (auto* node = audioGraph.getNodeForId (toNodeID (uid)))
+    if (auto* node = runtime.getNodeForId (toNodeID (uid)))
         return node->getProcessor()->getTotalNumInputChannels();
 
     return 0;
@@ -424,41 +698,38 @@ juce::String GraphAudioProcessor::roleToString (GraphNodeRole role)
     return "module";
 }
 
-GraphNodeRole GraphAudioProcessor::stringToRole (const juce::String& role)
-{
-    if (role == "input")  return GraphNodeRole::input;
-    if (role == "output") return GraphNodeRole::output;
-    return GraphNodeRole::module;
-}
-
+// Persist the logical graph and module state; JUCE runtime details are rebuilt on restore.
 void GraphAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     const juce::ScopedLock lock (graphLock);
 
     juce::ValueTree state (stateTag);
     state.setProperty ("version", 1, nullptr);
-    state.setProperty ("nextModuleNode", (int) nextModuleNode, nullptr);
+    state.setProperty ("nextModuleNode", (int) graphDocument.getNextModuleNodeUID(), nullptr);
 
     juce::ValueTree nodes (nodesTag);
 
-    for (const auto& [uid, record] : nodeRecords)
+    for (const auto& description : graphDocument.getNodes())
     {
         juce::ValueTree nodeState (nodeTag);
-        nodeState.setProperty ("uid", (int) uid, nullptr);
-        nodeState.setProperty ("role", roleToString (record.description.role), nullptr);
-        nodeState.setProperty ("moduleId", record.description.moduleId, nullptr);
-        nodeState.setProperty ("x", record.description.x, nullptr);
-        nodeState.setProperty ("y", record.description.y, nullptr);
+        nodeState.setProperty ("uid", (int) description.uid, nullptr);
+        nodeState.setProperty ("role", roleToString (description.role), nullptr);
+        nodeState.setProperty ("moduleId", description.moduleId, nullptr);
+        nodeState.setProperty ("x", description.x, nullptr);
+        nodeState.setProperty ("y", description.y, nullptr);
 
-        if (auto* processor = dynamic_cast<AudioModuleProcessor*> (audioGraph.getNodeForId (toNodeID (uid))->getProcessor()))
-            nodeState.addChild (processor->createModuleState(), -1, nullptr);
+        if (auto* runtimeNode = audioGraph->getNodeForId (toNodeID (description.uid)))
+        {
+            if (auto* processor = dynamic_cast<AudioModuleProcessor*> (runtimeNode->getProcessor()))
+                nodeState.addChild (processor->createModuleState(), -1, nullptr);
+        }
 
         nodes.addChild (nodeState, -1, nullptr);
     }
 
     juce::ValueTree connections (connectionsTag);
 
-    for (const auto& connection : logicalConnections)
+    for (const auto& connection : graphDocument.getConnections())
     {
         juce::ValueTree connectionState (connectionTag);
         connectionState.setProperty ("source", (int) connection.source, nullptr);
@@ -473,6 +744,8 @@ void GraphAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
         copyXmlToBinary (*xml, destData);
 }
 
+// Restore transactionally: build a complete candidate first and replace the
+// active graph only after validation, connection building and preparation succeed.
 void GraphAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     const auto xml = getXmlFromBinary (data, sizeInBytes);
@@ -480,81 +753,94 @@ void GraphAudioProcessor::setStateInformation (const void* data, int sizeInBytes
     if (xml == nullptr)
         return;
 
-    auto state = juce::ValueTree::fromXml (*xml);
+    auto parsed = parseStoredGraphState (juce::ValueTree::fromXml (*xml));
 
-    if (! state.hasType (stateTag))
+    if (! parsed.has_value())
         return;
 
-    suspendProcessing (true);
+    auto restoredDocument = parsed->document;
 
+    std::map<GraphNodeUID, std::unique_ptr<AudioModuleProcessor>> restoredProcessors;
+
+    for (const auto& node : restoredDocument.getNodes())
     {
-        const juce::ScopedLock lock (graphLock);
+        if (node.role != GraphNodeRole::module)
+            continue;
 
-        audioGraph.clear (Graph::UpdateKind::none);
-        nodeRecords.clear();
-        logicalConnections.clear();
-        nextModuleNode = (GraphNodeUID) juce::jmax (firstModuleNodeUID, (GraphNodeUID) (int) state.getProperty ("nextModuleNode", (int) firstModuleNodeUID));
+        auto processor = ModuleRegistry::createProcessor (node.moduleId);
 
-        addIONode (inputNodeUID, GraphNodeRole::input, { 130.0f, 260.0f });
-        addIONode (outputNodeUID, GraphNodeRole::output, { 820.0f, 260.0f });
+        if (processor == nullptr)
+            return;
 
-        if (const auto nodes = state.getChildWithName (nodesTag); nodes.isValid())
+        if (const auto stateForNode = parsed->moduleStates.find (node.uid);
+            stateForNode != parsed->moduleStates.end())
         {
-            for (int i = 0; i < nodes.getNumChildren(); ++i)
-            {
-                const auto nodeState = nodes.getChild (i);
-                const auto uid = (GraphNodeUID) (int) nodeState.getProperty ("uid", 0);
-                const auto role = stringToRole (nodeState.getProperty ("role").toString());
-                const juce::Point<float> position
-                {
-                    (float) nodeState.getProperty ("x", 100.0f),
-                    (float) nodeState.getProperty ("y", 100.0f)
-                };
-
-                if (uid == inputNodeUID || uid == outputNodeUID)
-                {
-                    if (auto it = nodeRecords.find (uid); it != nodeRecords.end())
-                    {
-                        it->second.description.x = position.x;
-                        it->second.description.y = position.y;
-                    }
-
-                    continue;
-                }
-
-                if (role == GraphNodeRole::module)
-                {
-                    const auto moduleState = nodeState.getChildWithName ("ModuleState");
-                    const auto moduleId = nodeState.getProperty ("moduleId").toString();
-                    addModuleNodeInternal (uid, moduleId, position, moduleState.isValid() ? &moduleState : nullptr);
-                }
-            }
+            processor->restoreModuleState (stateForNode->second);
         }
 
-        if (const auto connections = state.getChildWithName (connectionsTag); connections.isValid())
-        {
-            for (int i = 0; i < connections.getNumChildren(); ++i)
-            {
-                const auto connectionState = connections.getChild (i);
-                addLogicalConnectionInternal ({
-                    (GraphNodeUID) (int) connectionState.getProperty ("source", 0),
-                    (GraphNodeUID) (int) connectionState.getProperty ("destination", 0)
-                });
-            }
-        }
-
-        if (logicalConnections.empty())
-            addLogicalConnectionInternal ({ inputNodeUID, outputNodeUID });
-
-        audioGraph.setPlayConfigDetails (getTotalNumInputChannels(),
-                                         getTotalNumOutputChannels(),
-                                         currentSampleRate,
-                                         currentBlockSize);
-        audioGraph.prepareToPlay (currentSampleRate, currentBlockSize);
-        rebuildAudioGraphConnections();
+        restoredProcessors.emplace (node.uid, std::move (processor));
     }
 
-    suspendProcessing (false);
-    sendChangeMessage();
+    const auto wasSuspended = isSuspended();
+    suspendProcessing (true);
+    auto stateApplied = false;
+
+    {
+        const juce::ScopeGuard restoreSuspension { [this, wasSuspended]
+        {
+            suspendProcessing (wasSuspended);
+        } };
+
+        const juce::ScopedLock lock (graphLock);
+        const auto shouldReprepare = graphPrepared;
+        auto restoredGraph = std::make_unique<Graph>();
+        restoredGraph->setPlayConfigDetails (getTotalNumInputChannels(),
+                                              getTotalNumOutputChannels(),
+                                              currentSampleRate,
+                                              currentBlockSize);
+
+        const auto* input = restoredDocument.findNode (inputNodeUID);
+        const auto* output = restoredDocument.findNode (outputNodeUID);
+        auto runtimeBuilt = input != nullptr && output != nullptr
+                         && addIONodeToRuntime (*restoredGraph, *input)
+                         && addIONodeToRuntime (*restoredGraph, *output);
+
+        for (const auto& node : restoredDocument.getNodes())
+        {
+            if (! runtimeBuilt || node.role != GraphNodeRole::module)
+                continue;
+
+            auto processor = restoredProcessors.find (node.uid);
+            runtimeBuilt = processor != restoredProcessors.end()
+                        && addModuleNodeToRuntime (*restoredGraph,
+                                                  node.uid,
+                                                  std::move (processor->second));
+        }
+
+        runtimeBuilt = runtimeBuilt
+                    && rebuildAudioGraphConnections (*restoredGraph, restoredDocument);
+
+        if (runtimeBuilt && shouldReprepare)
+            restoredGraph->prepareToPlay (currentSampleRate, currentBlockSize);
+
+        if (! runtimeBuilt)
+            return;
+
+        // Only a complete candidate reaches this point, so swapping cannot expose a half-built graph.
+        auto previousGraph = std::move (audioGraph);
+        attachModuleProcessorListeners (*restoredGraph);
+        detachModuleProcessorListeners (*previousGraph);
+        audioGraph = std::move (restoredGraph);
+        graphDocument = std::move (restoredDocument);
+        graphPrepared = shouldReprepare;
+
+        if (shouldReprepare)
+            previousGraph->releaseResources();
+
+        stateApplied = true;
+    }
+
+    if (stateApplied)
+        sendChangeMessage();
 }
 } // namespace better

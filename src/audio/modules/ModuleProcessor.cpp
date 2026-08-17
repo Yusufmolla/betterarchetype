@@ -1,5 +1,8 @@
 #include "audio/modules/ModuleProcessor.h"
 
+#include <memory>
+#include <utility>
+
 namespace better
 {
 AudioModuleProcessor::AudioModuleProcessor (ModuleDescriptor descriptorIn)
@@ -17,9 +20,7 @@ const juce::String AudioModuleProcessor::getName() const
 
 void AudioModuleProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    currentSampleRate = sampleRate;
-    currentBlockSize = juce::jmax (1, samplesPerBlock);
-    onPrepared (currentSampleRate, currentBlockSize);
+    onPrepared (sampleRate, juce::jmax (1, samplesPerBlock));
     onReset();
 }
 
@@ -27,23 +28,35 @@ void AudioModuleProcessor::releaseResources()
 {
 }
 
+void AudioModuleProcessor::reset()
+{
+    onReset();
+}
+
 void AudioModuleProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
     midiMessages.clear();
 
-    if (! isModuleEnabled() || buffer.getNumSamples() <= 0)
+    if (! isModuleEnabled() || buffer.getNumSamples() <= 0 || getBusCount (false) <= 0)
         return;
 
-    processAudio (buffer, buffer.getNumSamples());
+    auto mainOutputBus = getBusBuffer (buffer, false, 0);
 
-    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+    const auto sanitiseBuffer = [] (juce::AudioBuffer<float>& bus)
     {
-        auto* samples = buffer.getWritePointer (channel);
+        for (int channel = 0; channel < bus.getNumChannels(); ++channel)
+        {
+            auto* samples = bus.getWritePointer (channel);
 
-        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
-            samples[sample] = sanitiseAudioSample (samples[sample]);
-    }
+            for (int sample = 0; sample < bus.getNumSamples(); ++sample)
+                samples[sample] = sanitiseAudioSample (samples[sample]);
+        }
+    };
+
+    sanitiseBuffer (mainOutputBus);
+    processAudio (mainOutputBus, mainOutputBus.getNumSamples());
+    sanitiseBuffer (mainOutputBus);
 }
 
 void AudioModuleProcessor::setCurrentProgram (int index)
@@ -97,8 +110,12 @@ juce::ValueTree AudioModuleProcessor::createModuleState()
 
 void AudioModuleProcessor::restoreModuleState (const juce::ValueTree& state)
 {
-    if (! state.isValid())
+    if (! state.hasType ("ModuleState")
+        || ! state.hasProperty ("moduleId")
+        || state.getProperty ("moduleId").toString() != descriptor.moduleId)
+    {
         return;
+    }
 
     if (const auto parameterState = state.getChildWithName ("Parameters"); parameterState.isValid())
         parameters.replaceState (parameterState);
@@ -142,14 +159,6 @@ bool AudioModuleProcessor::isModuleEnabled() const
         return enabled->load() > 0.5f;
 
     return true;
-}
-
-float AudioModuleProcessor::getFloatParameter (const juce::String& parameterId, float fallback) const
-{
-    if (auto* value = parameters.getRawParameterValue (parameterId))
-        return value->load();
-
-    return fallback;
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout AudioModuleProcessor::createParameterLayout (const std::vector<ModuleControlDescriptor>& controls)

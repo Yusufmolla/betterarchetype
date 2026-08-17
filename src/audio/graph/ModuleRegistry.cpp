@@ -3,7 +3,6 @@
 #include "audio/modules/DriveProcessor.h"
 #include "audio/modules/IRCabProcessor.h"
 #include "audio/modules/NAMProcessor.h"
-#include "audio/modules/AmpProcessor.h"
 #include "audio/modules/RouterProcessor.h"
 
 namespace better
@@ -15,7 +14,6 @@ const std::vector<ModuleDescriptor>& ModuleRegistry::getModules()
         DriveProcessor::createDescriptor(),
         NAMProcessor::createDescriptor(),
         IRCabProcessor::createDescriptor(),
-        AmpProcessor::createDescriptor(),
         RouterProcessor::createDescriptor()
     };
 
@@ -36,7 +34,6 @@ std::unique_ptr<AudioModuleProcessor> ModuleRegistry::createProcessor (const juc
     if (moduleId == "drive") return std::make_unique<DriveProcessor>();
     if (moduleId == "nam")   return std::make_unique<NAMProcessor>();
     if (moduleId == "ir")    return std::make_unique<IRCabProcessor>();
-    if (moduleId == "amp_basic") return std::make_unique<AmpProcessor>();
     if (moduleId == "router_basic") return std::make_unique<RouterProcessor>();
     
     return {};
